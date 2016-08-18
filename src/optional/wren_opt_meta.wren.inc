@@ -31,4 +31,9 @@ static const char* metaModuleSource =
 "\n"
 "  foreign static compile_(source, isExpression, printErrors)\n"
 "  foreign static getModuleVariables_(module)\n"
+"}\n"
+"\n"
+"class ClassMirror {\n"
+"  foreign static definesMethod(aClass, method)\n"
+"  foreign static definesClass(aClass, anotherClass)\n"
 "}\n";

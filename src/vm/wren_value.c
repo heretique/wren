@@ -130,6 +130,20 @@ void wrenBindMethod(WrenVM* vm, ObjClass* classObj, int symbol, Method method)
   classObj->methods.data[symbol] = method;
 }
 
+const Method* wrenFindMethod(WrenVM* vm, const ObjClass* classObj,
+                             const ObjString* methodStr)
+{
+  int symbol = wrenSymbolTableFind(&vm->methodNames,
+                                   methodStr->value, methodStr->length);
+  if (symbol >= 0 && symbol < classObj->methods.count
+      && classObj->methods.data[symbol].type != METHOD_NONE)
+  {
+    return &classObj->methods.data[symbol];
+  }
+
+  return NULL;
+}
+
 ObjClosure* wrenNewClosure(WrenVM* vm, ObjFn* fn)
 {
   ObjClosure* closure = ALLOCATE_FLEX(vm, ObjClosure,

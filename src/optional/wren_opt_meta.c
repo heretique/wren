@@ -7,7 +7,7 @@
 #include "wren_vm.h"
 #include "wren_opt_meta.wren.inc"
 
-void metaCompile(WrenVM* vm)
+static void metaCompile(WrenVM* vm)
 {
   const char* source = wrenGetSlotString(vm, 1);
   bool isExpression = wrenGetSlotBool(vm, 2);
@@ -29,7 +29,8 @@ void metaCompile(WrenVM* vm)
   }
 }
 
-void metaGetModuleVariables(WrenVM* vm) {
+static void metaGetModuleVariables(WrenVM* vm)
+{
   wrenEnsureSlots(vm, 3);
   
   Value moduleValue = wrenMapGet(vm->modules, vm->apiStack[1]);
@@ -58,6 +59,56 @@ void metaGetModuleVariables(WrenVM* vm) {
   }
 }
 
+static void classMirrorDefinesMethod(WrenVM* vm)
+{
+  Value classValue = vm->apiStack[1];
+  Value methodValue = vm->apiStack[2];
+
+  if (!IS_CLASS(classValue) || !IS_STRING(methodValue))
+  {
+    wrenSetSlotNull(vm, 0);
+    return;
+  }
+
+  const ObjClass* classObj = AS_CLASS(classValue);
+  const ObjString *methodStr = AS_STRING(methodValue);
+
+  wrenSetSlotBool(vm, 0, wrenFindMethod(vm, classObj, methodStr) != NULL);
+}
+
+static void classMirrorDefinesClass(WrenVM* vm)
+{
+  Value classValue = vm->apiStack[1];
+  Value anotherClassValue = vm->apiStack[2];
+
+  if (!IS_CLASS(classValue) || !IS_CLASS(anotherClassValue))
+  {
+    wrenSetSlotNull(vm, 0);
+    return;
+  }
+
+  ObjClass* classObj = AS_CLASS(classValue);
+  ObjClass* anotherClassObj = AS_CLASS(anotherClassValue);
+
+  if (classObj->methods.count < anotherClassObj->methods.count)
+  {
+    wrenSetSlotBool(vm, 0, false);
+    return;
+  }
+
+  for (int symbol = 0; symbol < anotherClassObj->methods.count; ++symbol)
+  {
+    if (classObj->methods.data[symbol].type == METHOD_NONE &&
+        anotherClassObj->methods.data[symbol].type != METHOD_NONE)
+    {
+      wrenSetSlotBool(vm, 0, false);
+      return;
+    }
+  }
+
+  wrenSetSlotBool(vm, 0, true);
+}
+
 const char* wrenMetaSource()
 {
   return metaModuleSource;
@@ -69,17 +120,29 @@ WrenForeignMethodFn wrenMetaBindForeignMethod(WrenVM* vm,
                                               const char* signature)
 {
   // There is only one foreign method in the meta module.
-  ASSERT(strcmp(className, "Meta") == 0, "Should be in Meta class.");
   ASSERT(isStatic, "Should be static.");
   
-  if (strcmp(signature, "compile_(_,_,_)") == 0)
+  if (strcmp(className, "Meta") == 0)
   {
-    return metaCompile;
+    if (strcmp(signature, "compile_(_,_,_)") == 0)
+    {
+      return metaCompile;
+    }
+    if (strcmp(signature, "getModuleVariables_(_)") == 0)
+    {
+      return metaGetModuleVariables;
+    }
   }
-  
-  if (strcmp(signature, "getModuleVariables_(_)") == 0)
+  else if (strcmp(className, "ClassMirror") == 0)
   {
-    return metaGetModuleVariables;
+    if (strcmp(signature, "definesMethod(_,_)") == 0)
+    {
+      return classMirrorDefinesMethod;
+    }
+    if (strcmp(signature, "definesClass(_,_)") == 0)
+    {
+      return classMirrorDefinesClass;
+    }
   }
   
   ASSERT(false, "Unknown method.");

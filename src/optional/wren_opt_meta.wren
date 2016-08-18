@@ -30,3 +30,8 @@ class Meta {
   foreign static compile_(source, isExpression, printErrors)
   foreign static getModuleVariables_(module)
 }
+
+class ClassMirror {
+  foreign static definesMethod(aClass, method)
+  foreign static definesClass(aClass, anotherClass)
+}
