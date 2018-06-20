@@ -150,6 +150,9 @@ void wrenCollectGarbage(WrenVM* vm)
   // Any object the compiler is using (if there is one).
   if (vm->compiler != NULL) wrenMarkCompiler(vm, vm->compiler);
 
+  // Method names.
+  wrenBlackenSymbolTable(vm, &vm->methodNames);
+
   // Now that we have grayed the roots, do a depth-first search over all of the
   // reachable objects.
   wrenBlackenObjects(vm);
@@ -420,7 +423,7 @@ static void runtimeError(WrenVM* vm)
 static void methodNotFound(WrenVM* vm, ObjClass* classObj, int symbol)
 {
   vm->fiber->error = wrenStringFormat(vm, "@ does not implement '$'.",
-      OBJ_VAL(classObj->name), vm->methodNames.data[symbol].buffer);
+      OBJ_VAL(classObj->name), vm->methodNames.data[symbol]->value);
 }
 
 // Checks that [value], which must be a closure, does not require more
@@ -474,8 +477,8 @@ static ObjModule* getModule(WrenVM* vm, Value name)
   return !IS_UNDEFINED(moduleValue) ? AS_MODULE(moduleValue) : NULL;
 }
 
-static ObjFiber* compileInModule(WrenVM* vm, Value name, const char* source,
-                                 bool isExpression, bool printErrors)
+static ObjClosure* compileInModule(WrenVM* vm, Value name, const char* source,
+                                   bool isExpression, bool printErrors)
 {
   // See if the module has already been loaded.
   ObjModule* module = getModule(vm, name);
@@ -492,8 +495,8 @@ static ObjFiber* compileInModule(WrenVM* vm, Value name, const char* source,
     for (int i = 0; i < coreModule->variables.count; i++)
     {
       wrenDefineVariable(vm, module,
-                         coreModule->variableNames.data[i].buffer,
-                         coreModule->variableNames.data[i].length,
+                         coreModule->variableNames.data[i]->value,
+                         coreModule->variableNames.data[i]->length,
                          coreModule->variables.data[i]);
     }
   }
@@ -505,19 +508,12 @@ static ObjFiber* compileInModule(WrenVM* vm, Value name, const char* source,
     return NULL;
   }
 
-  wrenPushRoot(vm, (Obj*)fn);
-  
   // Functions are always wrapped in closures.
+  wrenPushRoot(vm, (Obj*)fn);
   ObjClosure* closure = wrenNewClosure(vm, fn);
-  wrenPushRoot(vm, (Obj*)closure);
-  
-  ObjFiber* moduleFiber = wrenNewFiber(vm, closure);
-
-  wrenPopRoot(vm); // closure.
   wrenPopRoot(vm); // fn.
 
-  // Return the fiber that executes the module.
-  return moduleFiber;
+  return closure;
 }
 
 // Verifies that [superclassValue] is a valid object to inherit from. That
@@ -698,6 +694,60 @@ void wrenFinalizeForeign(WrenVM* vm, ObjForeign* foreign)
 
   WrenFinalizerFn finalizer = (WrenFinalizerFn)method->fn.foreign;
   finalizer(foreign->data);
+}
+
+Value wrenImportModule(WrenVM* vm, Value name)
+{
+  // If the module is already loaded, we don't need to do anything.
+  if (!IS_UNDEFINED(wrenMapGet(vm->modules, name))) return NULL_VAL;
+  
+  const char* source = NULL;
+  bool allocatedSource = true;
+  
+  // Let the host try to provide the module.
+  if (vm->config.loadModuleFn != NULL)
+  {
+    source = vm->config.loadModuleFn(vm, AS_CSTRING(name));
+  }
+  
+  // If the host didn't provide it, see if it's a built in optional module.
+  if (source == NULL)
+  {
+    ObjString* nameString = AS_STRING(name);
+#if WREN_OPT_META
+    if (strcmp(nameString->value, "meta") == 0) source = wrenMetaSource();
+#endif
+#if WREN_OPT_RANDOM
+    if (strcmp(nameString->value, "random") == 0) source = wrenRandomSource();
+#endif
+    
+    // TODO: Should we give the host the ability to provide strings that don't
+    // need to be freed?
+    allocatedSource = false;
+  }
+  
+  if (source == NULL)
+  {
+    vm->fiber->error = wrenStringFormat(vm, "Could not load module '@'.", name);
+    return NULL_VAL;
+  }
+  
+  ObjClosure* moduleClosure = compileInModule(vm, name, source, false, true);
+  
+  // Modules loaded by the host are expected to be dynamically allocated with
+  // ownership given to the VM, which will free it. The built in optional
+  // modules are constant strings which don't need to be freed.
+  if (allocatedSource) DEALLOCATE(vm, (char*)source);
+  
+  if (moduleClosure == NULL)
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+                                        "Could not compile module '@'.", name);
+    return NULL_VAL;
+  }
+  
+  // Return the closure that executes the module.
+  return OBJ_VAL(moduleClosure);
 }
 
 // The main bytecode interpreter loop. This is where the magic happens. It is
@@ -1202,23 +1252,19 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       Value name = fn->constants.data[READ_SHORT()];
 
       // Make a slot on the stack for the module's fiber to place the return
-      // value. It will be popped after this fiber is resumed.
-      PUSH(NULL_VAL);
+      // value. It will be popped after this fiber is resumed. Store the
+      // imported module's closure in the slot in case a GC happens when
+      // invoking the closure.
+      PUSH(wrenImportModule(vm, name));
       
-      Value result = wrenImportModule(vm, name);
       if (!IS_NULL(fiber->error)) RUNTIME_ERROR();
 
-      // If we get a fiber, switch to it to execute the module body.
-      if (IS_FIBER(result))
+      // If we get a closure, call it to execute the module body.
+      if (IS_CLOSURE(PEEK()))
       {
         STORE_FRAME();
-
-        // Return to this module when that one is done.
-        AS_FIBER(result)->caller = fiber;
-
-        // Switch to the module's fiber.
-        fiber = AS_FIBER(result);
-        vm->fiber = fiber;
+        ObjClosure* closure = AS_CLOSURE(PEEK());
+        callFunction(vm, fiber, closure, 1);
         LOAD_FRAME();
       }
 
@@ -1369,13 +1415,17 @@ WrenInterpretResult wrenInterpret(WrenVM* vm, const char* source)
 WrenInterpretResult wrenInterpretInModule(WrenVM* vm, const char* module,
                                           const char* source)
 {
-  ObjFiber* fiber = wrenCompileSource(vm, module, source, false, true);
-  if (fiber == NULL) return WREN_RESULT_COMPILE_ERROR;
+  ObjClosure* closure = wrenCompileSource(vm, module, source, false, true);
+  if (closure == NULL) return WREN_RESULT_COMPILE_ERROR;
+  
+  wrenPushRoot(vm, (Obj*)closure);
+  ObjFiber* fiber = wrenNewFiber(vm, closure);
+  wrenPopRoot(vm); // closure.
   
   return runInterpreter(vm, fiber);
 }
 
-ObjFiber* wrenCompileSource(WrenVM* vm, const char* module, const char* source,
+ObjClosure* wrenCompileSource(WrenVM* vm, const char* module, const char* source,
                             bool isExpression, bool printErrors)
 {
   Value nameValue = NULL_VAL;
@@ -1385,74 +1435,11 @@ ObjFiber* wrenCompileSource(WrenVM* vm, const char* module, const char* source,
     wrenPushRoot(vm, AS_OBJ(nameValue));
   }
   
-  ObjFiber* fiber = compileInModule(vm, nameValue, source,
-                                    isExpression, printErrors);
-  if (fiber == NULL && module != NULL)
-  {
-    wrenPopRoot(vm); // nameValue.
-    return NULL;
-  }
-  
-  if (module != NULL)
-  {
-    wrenPopRoot(vm); // nameValue.
-  }
-  
-  return fiber;
-}
+  ObjClosure* closure = compileInModule(vm, nameValue, source,
+                                        isExpression, printErrors);
 
-Value wrenImportModule(WrenVM* vm, Value name)
-{
-  // If the module is already loaded, we don't need to do anything.
-  if (!IS_UNDEFINED(wrenMapGet(vm->modules, name))) return NULL_VAL;
-
-  const char* source = NULL;
-  bool allocatedSource = true;
-
-  // Let the host try to provide the module.
-  if (vm->config.loadModuleFn != NULL)
-  {
-    source = vm->config.loadModuleFn(vm, AS_CSTRING(name));
-  }
-
-  // If the host didn't provide it, see if it's a built in optional module.
-  if (source == NULL)
-  {
-    ObjString* nameString = AS_STRING(name);
-#if WREN_OPT_META
-    if (strcmp(nameString->value, "meta") == 0) source = wrenMetaSource();
-#endif
-#if WREN_OPT_RANDOM
-    if (strcmp(nameString->value, "random") == 0) source = wrenRandomSource();
-#endif
-    
-    // TODO: Should we give the host the ability to provide strings that don't
-    // need to be freed?
-    allocatedSource = false;
-  }
-  
-  if (source == NULL)
-  {
-    vm->fiber->error = wrenStringFormat(vm, "Could not load module '@'.", name);
-    return NULL_VAL;
-  }
-  
-  ObjFiber* moduleFiber = compileInModule(vm, name, source, false, true);
-  
-  // Modules loaded by the host are expected to be dynamically allocated with
-  // ownership given to the VM, which will free it. The built in optional
-  // modules are constant strings which don't need to be freed.
-  if (allocatedSource) DEALLOCATE(vm, (char*)source);
-  
-  if (moduleFiber == NULL)
-  {
-    vm->fiber->error = wrenStringFormat(vm,
-                                        "Could not compile module '@'.", name);
-    return NULL_VAL;
-  }
-  
-  // Return the fiber that executes the module.
-  return OBJ_VAL(moduleFiber);
+  if (module != NULL) wrenPopRoot(vm); // nameValue.
+  return closure;
 }
 
 Value wrenGetModuleVariable(WrenVM* vm, Value moduleName, Value variableName)
@@ -1745,7 +1732,7 @@ void wrenGetVariable(WrenVM* vm, const char* module, const char* name,
                      int slot)
 {
   ASSERT(module != NULL, "Module cannot be NULL.");
-  ASSERT(module != NULL, "Variable name cannot be NULL.");  
+  ASSERT(name != NULL, "Variable name cannot be NULL.");  
   validateApiSlot(vm, slot);
   
   Value moduleName = wrenStringFormat(vm, "$", module);
