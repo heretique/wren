@@ -185,7 +185,7 @@ ObjFiber* wrenNewFiber(WrenVM* vm, ObjClosure* closure)
   fiber->openUpvalues = NULL;
   fiber->caller = NULL;
   fiber->error = NULL_VAL;
-  fiber->callerIsTrying = false;
+  fiber->state = FIBER_OTHER;
   
   if (closure != NULL)
   {
@@ -1022,7 +1022,7 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
   {
     if (classObj->methods.data[i].type == METHOD_BLOCK)
     {
-      wrenGrayObj(vm, (Obj*)classObj->methods.data[i].fn.obj);
+      wrenGrayObj(vm, (Obj*)classObj->methods.data[i].as.closure);
     }
   }
 

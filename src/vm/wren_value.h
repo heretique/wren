@@ -293,6 +293,24 @@ typedef struct
   Value* stackStart;
 } CallFrame;
 
+// Tracks how this fiber has been invoked, aside from the ways that can be
+// detected from the state of other fields in the fiber.
+typedef enum
+{
+  // The fiber is being run from another fiber using a call to `try()`.
+  FIBER_TRY,
+  
+  // The fiber was directly invoked by `runInterpreter()`. This means it's the
+  // initial fiber used by a call to `wrenCall()` or `wrenInterpret()`.
+  FIBER_ROOT,
+  
+  // The fiber is invoked some other way. If [caller] is `NULL` then the fiber
+  // was invoked using `call()`. If [numFrames] is zero, then the fiber has
+  // finished running and is done. If [numFrames] is one and that frame's `ip`
+  // points to the first byte of code, the fiber has not been started yet.
+  FIBER_OTHER,
+} FiberState;
+
 typedef struct sObjFiber
 {
   Obj obj;
@@ -331,10 +349,7 @@ typedef struct sObjFiber
   // error object. Otherwise, it will be null.
   Value error;
   
-  // This will be true if the caller that called this fiber did so using "try".
-  // In that case, if this fiber fails with an error, the error will be given
-  // to the caller.
-  bool callerIsTrying;
+  FiberState state;
 } ObjFiber;
 
 typedef enum
@@ -349,9 +364,6 @@ typedef enum
   // A normal user-defined method.
   METHOD_BLOCK,
   
-  // The special "call(...)" methods on function.
-  METHOD_FN_CALL,
-
   // No method for the given symbol.
   METHOD_NONE
 } MethodType;
@@ -366,10 +378,8 @@ typedef struct
   {
     Primitive primitive;
     WrenForeignMethodFn foreign;
-    
-    // May be a [ObjFn] or [ObjClosure].
-    ObjClosure* obj;
-  } fn;
+    ObjClosure* closure;
+  } as;
 } Method;
 
 DECLARE_BUFFER(Method, Method);
